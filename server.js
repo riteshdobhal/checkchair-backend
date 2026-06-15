@@ -22,8 +22,8 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT) {
 }
 
 
-admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-const db = admin.firestore();
+initializeApp({ credential: cert(serviceAccount) });
+const db =  getFirestore();
 console.log('✅ Firestore connected');
 
 // Collections
