@@ -177,7 +177,7 @@ async function notifySubscriber(sub, salon, count) {
 
   if (fcmToken) {
     try {
-      await messaging().send({
+      await messaging.send({
         token: fcmToken,
         notification: {
           title: `${salon.name} is quiet now!`,
