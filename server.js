@@ -123,6 +123,9 @@ app.get('/salon/:salonId', async (req, res) => {
   res.json(snap.data());
 });
 
+app.get('/health', (req, res) => {
+  res.json({ ok: true, status: 'awake', time: new Date().toISOString() });
+});
 app.get('/salons', async (req, res) => {
   const snap = await salonsCol.get();
   const salons = snap.docs.map(d => {
