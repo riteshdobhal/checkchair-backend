@@ -181,13 +181,21 @@ async function notifySubscriber(sub, salon, count) {
   if (fcmToken) {
     try {
       await messaging.send({
-        token: fcmToken,
-        notification: {
-          title: `${salon.name} is quiet now!`,
-          body:  `Only ${count} customer(s) right now. Come on in!`,
-        },
-        android: { priority: 'high', notification: { channelId: 'freechair-alerts', sound: 'default' } },
-      });
+       token: fcmToken,
+      notification: {
+        title: `${salon.name} is quiet now!`,
+        body:  `Only ${count} customer(s) right now. Come on in!`,
+      },
+      data: {                          // ← ADD THIS BLOCK
+        salonId:   salon.id,
+        salonName: salon.name,
+        screen:    'SalonDetail',
+      },
+      android: {
+        priority: 'high',
+        notification: { channelId: 'freechair-alerts', sound: 'default' },
+      },
+    });
       return; // push delivered — no need for WhatsApp
     } catch (err) {
       console.log('FCM send failed, will try WhatsApp:', err.message);
