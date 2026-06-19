@@ -1,6 +1,7 @@
 // ════════════════════════════════════════════════════════════════════════════════
 //  FreeChair backend — complete server.js
-//  Firestore + Firebase OTP login + FCM push + optional Twilio WhatsApp
+//  Firestore + Firebase OTP login + FCM push + multi-vertical categories
+//  + optional Twilio WhatsApp + notification deep-link payload
 // ════════════════════════════════════════════════════════════════════════════════
 
 const express = require('express');
@@ -45,11 +46,19 @@ if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────────
-const salonKey = (phone) => `salon_${phone.replace(/\D/g, '')}`;
-const subKey   = (phone, salonId) => `${phone}_${salonId}`;
+const bizKey = (phone) => `salon_${phone.replace(/\D/g, '')}`;
+const subKey = (phone, salonId) => `${phone}_${salonId}`;
+
+// Default capacity per category (used when a new business is created)
+const DEFAULT_CAP = { salon: 6, restaurant: 20, clinic: 15, gym: 40, cafe: 15 };
+
+// ── Health check (for uptime ping — does NOT touch Firestore) ───────────────────
+app.get('/health', (req, res) => {
+  res.json({ ok: true, status: 'awake', time: new Date().toISOString() });
+});
 
 // ════════════════════════════════════════════════════════════════════════════════
-//  AUTH  (Firebase verifies OTP in the app; backend just creates/loads the user)
+//  AUTH  (Firebase verifies OTP in the app; backend creates/loads the user)
 // ════════════════════════════════════════════════════════════════════════════════
 
 app.post('/auth/firebase-login', async (req, res) => {
@@ -63,14 +72,14 @@ app.post('/auth/firebase-login', async (req, res) => {
   if (userSnap.exists) {
     user = userSnap.data();
   } else {
-    user = { id: phone, phone, firebaseUid: firebaseUid || '', name: '', role: null, salonId: null, fcmToken: null, createdAt: Date.now() };
+    user = { id: phone, phone, firebaseUid: firebaseUid || '', name: '', role: null, salonId: null, category: null, fcmToken: null, createdAt: Date.now() };
     await userRef.set(user);
   }
   res.json({ ok: true, user });
 });
 
 app.post('/auth/set-role', async (req, res) => {
-  const { phone, role, name } = req.body;
+  const { phone, role, name, category } = req.body;
   if (!phone || !role || !name) return res.status(400).json({ error: 'phone, role and name required' });
 
   const userRef  = usersCol.doc(phone);
@@ -78,17 +87,28 @@ app.post('/auth/set-role', async (req, res) => {
   if (!userSnap.exists) return res.status(404).json({ error: 'User not found' });
 
   const updates = { name, role };
+
   if (role === 'owner') {
-    const sid      = salonKey(phone);
+    const cat      = category || 'salon';
+    const sid      = bizKey(phone);
     const salonRef = salonsCol.doc(sid);
     if (!(await salonRef.get()).exists) {
       await salonRef.set({
-        id: sid, name: `${name}'s Salon`, address: 'Address not set',
-        hours: 'Hours not set', capacity: 6, count: 0, ownerId: phone, createdAt: Date.now(),
+        id: sid,
+        name: `${name}'s ${cat}`,
+        category: cat,
+        address: 'Address not set',
+        hours: 'Hours not set',
+        capacity: DEFAULT_CAP[cat] || 6,
+        count: 0,
+        ownerId: phone,
+        createdAt: Date.now(),
       });
     }
-    updates.salonId = sid;
+    updates.salonId  = sid;
+    updates.category = cat;
   }
+
   await userRef.update(updates);
   const updated = { ...userSnap.data(), ...updates };
   res.json({ ok: true, user: updated, salonId: updated.salonId });
@@ -103,7 +123,7 @@ app.post('/save-token', async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════════
-//  SALONS
+//  BUSINESSES (salons / restaurants / clinics / gyms / cafes)
 // ════════════════════════════════════════════════════════════════════════════════
 
 app.post('/salon/profile', async (req, res) => {
@@ -123,14 +143,19 @@ app.get('/salon/:salonId', async (req, res) => {
   res.json(snap.data());
 });
 
-app.get('/health', (req, res) => {
-  res.json({ ok: true, status: 'awake', time: new Date().toISOString() });
-});
+// List — optionally filtered by category (?category=restaurant)
 app.get('/salons', async (req, res) => {
-  const snap = await salonsCol.get();
+  const { category } = req.query;
+  let query = salonsCol;
+  if (category) query = salonsCol.where('category', '==', category);
+
+  const snap = await query.get();
   const salons = snap.docs.map(d => {
     const s = d.data();
-    return { id: s.id, name: s.name, address: s.address, hours: s.hours, count: s.count, capacity: s.capacity };
+    return {
+      id: s.id, name: s.name, address: s.address, hours: s.hours,
+      count: s.count, capacity: s.capacity, category: s.category || 'salon',
+    };
   });
   res.json({ salons });
 });
@@ -141,6 +166,7 @@ app.get('/salons', async (req, res) => {
 
 app.post('/count', async (req, res) => {
   const { count, salonId } = req.body;
+  console.log(`\n📊 COUNT UPDATE: salonId=${salonId}, count=${count}`);
   if (salonId === undefined || count === undefined) return res.status(400).json({ error: 'count and salonId required' });
 
   const salonRef  = salonsCol.doc(salonId);
@@ -154,12 +180,12 @@ app.post('/count', async (req, res) => {
 
   // Notify subscribers who just crossed their threshold (busy → quiet)
   const subsSnap = await subsCol.where('salonId', '==', salonId).get();
+  console.log(`   Subscribers: ${subsSnap.size}`);
   for (const doc of subsSnap.docs) {
     const sub = doc.data();
     if (prev >= sub.threshold && count < sub.threshold) {
+      console.log(`   ✅ Threshold crossed for ${sub.phone} — notifying`);
       await notifySubscriber(sub, salon, count);
-      // Optional: auto-remove after one alert (notify-once model)
-      // await subsCol.doc(doc.id).delete();
     }
   }
   res.json({ ok: true });
@@ -174,40 +200,38 @@ app.get('/count', async (req, res) => {
 
 // ── Notify one subscriber: FCM push first (free), WhatsApp backup (paid) ─────────
 async function notifySubscriber(sub, salon, count) {
-  // 1) FCM push (free) — if the user has a saved device token
   const userSnap = await usersCol.doc(sub.phone).get();
   const fcmToken = userSnap.exists ? userSnap.data().fcmToken : null;
+  console.log(`   📲 notify ${sub.phone}, hasToken=${!!fcmToken}`);
 
   if (fcmToken) {
     try {
       await messaging.send({
-       token: fcmToken,
-      notification: {
-        title: `${salon.name} is quiet now!`,
-        body:  `Only ${count} customer(s) right now. Come on in!`,
-      },
-      data: {                          // ← ADD THIS BLOCK
-        salonId:   salon.id,
-        salonName: salon.name,
-        screen:    'SalonDetail',
-      },
-      android: {
-        priority: 'high',
-        notification: { channelId: 'freechair-alerts', sound: 'default' },
-      },
-    });
-      return; // push delivered — no need for WhatsApp
+        token: fcmToken,
+        notification: {
+          title: `${salon.name} is quiet now!`,
+          body:  `Only ${count} now. Come on in!`,
+        },
+        data: {
+          salonId:   salon.id,
+          salonName: salon.name,
+          screen:    'SalonDetail',
+        },
+        android: { priority: 'high', notification: { channelId: 'freechair-alerts', sound: 'default' } },
+      });
+      console.log(`   ✅ FCM push sent to ${sub.phone}`);
+      return;
     } catch (err) {
-      console.log('FCM send failed, will try WhatsApp:', err.message);
+      console.log(`   ❌ FCM failed, trying WhatsApp: ${err.message}`);
     }
   }
 
-  // 2) WhatsApp backup (paid) — only if no token or push failed, and Twilio is set
   if (twilio) {
     await twilio.messages.create({
       from: WHATSAPP_FROM, to: `whatsapp:+91${sub.phone}`,
-      body: `Hi ${sub.name}! ${salon.name} now has only ${count} customer(s). You set an alert for fewer than ${sub.threshold}. Come on in! 💈`,
-    }).catch(err => console.log('WhatsApp send failed:', err.message));
+      body: `Hi ${sub.name}! ${salon.name} now has only ${count} customer(s). Come on in! 💈`,
+    }).then(() => console.log(`   ✅ WhatsApp sent to ${sub.phone}`))
+      .catch(err => console.log(`   ❌ WhatsApp failed: ${err.message}`));
   }
 }
 
@@ -272,5 +296,5 @@ io.on('connection', async (socket) => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`\n🚀 FreeChair backend running on port ${PORT}`);
-  console.log('   Notifications: FCM push (free) + WhatsApp backup (if Twilio set)\n');
+  console.log('   Multi-vertical + FCM push + WhatsApp backup\n');
 });
