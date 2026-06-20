@@ -155,9 +155,53 @@ app.get('/venues', async (req, res) => {
     return {
       id: s.id, name: s.name, address: s.address, hours: s.hours,
       count: s.count, capacity: s.capacity, category: s.category || 'salon',
+      ownerId: s.ownerId || null,
     };
   });
   res.json({ venues });
+});
+
+// List UNCLAIMED venues for an owner to claim, filtered by category.
+// (?category=gym)  — only returns venues with no ownerId yet.
+app.get('/venues/claimable', async (req, res) => {
+  const { category } = req.query;
+  let query = venuesCol;
+  if (category) query = venuesCol.where('category', '==', category);
+
+  const snap = await query.get();
+  const venues = snap.docs
+    .map(d => d.data())
+    .filter(s => !s.ownerId)                 // unclaimed only
+    .map(s => ({
+      id: s.id, name: s.name, address: s.address, hours: s.hours,
+      count: s.count, capacity: s.capacity, category: s.category || 'salon',
+    }));
+  res.json({ venues });
+});
+
+// Owner claims an existing (seeded) venue. One owner per venue.
+app.post('/venue/claim', async (req, res) => {
+  const { phone, venueId, name } = req.body;
+  if (!phone || !venueId) return res.status(400).json({ error: 'phone and venueId required' });
+
+  const venueRef = venuesCol.doc(venueId);
+  const snap     = await venueRef.get();
+  if (!snap.exists)        return res.status(404).json({ error: 'Venue not found' });
+  if (snap.data().ownerId) return res.status(409).json({ error: 'This venue is already claimed' });
+
+  const venue = snap.data();
+
+  // Link both directions: venue → owner, owner → venue (+ inherit category).
+  await venueRef.update({ ownerId: phone });
+  await usersCol.doc(phone).update({
+    role: 'owner',
+    venueId,
+    category: venue.category || 'salon',
+    ...(name ? { name } : {}),
+  });
+
+  const userSnap = await usersCol.doc(phone).get();
+  res.json({ ok: true, venue: { ...venue, ownerId: phone }, user: userSnap.data() });
 });
 
 // ════════════════════════════════════════════════════════════════════════════════
