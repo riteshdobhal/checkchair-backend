@@ -32,7 +32,7 @@ const messaging = getMessaging();
 console.log('✅ Firestore + FCM connected');
 
 const usersCol = db.collection('users');
-const venuesCol = db.collection('venues');
+const venuesCol = db.collection('salons');
 const subsCol  = db.collection('subscriptions');
 
 // ── Optional Twilio (WhatsApp backup) ───────────────────────────────────────────
@@ -50,7 +50,7 @@ const bizKey = (phone) => `venue_${phone.replace(/\D/g, '')}`;
 const subKey = (phone, venueId) => `${phone}_${venueId}`;
 
 // Default capacity per category (used when a new business is created)
-const DEFAULT_CAP = { venue: 6, restaurant: 20, clinic: 15, gym: 40, cafe: 15 };
+const DEFAULT_CAP = { salon: 6, restaurant: 20, clinic: 15, gym: 40, cafe: 15 };
 
 // ── Health check (for uptime ping — does NOT touch Firestore) ───────────────────
 app.get('/health', (req, res) => {
@@ -89,7 +89,7 @@ app.post('/auth/set-role', async (req, res) => {
   const updates = { name, role };
 
   if (role === 'owner') {
-    const cat      = category || 'venue';
+    const cat      = category || 'salon';
     const sid      = bizKey(phone);
     const venueRef = venuesCol.doc(sid);
     if (!(await venueRef.get()).exists) {
@@ -154,7 +154,7 @@ app.get('/venues', async (req, res) => {
     const s = d.data();
     return {
       id: s.id, name: s.name, address: s.address, hours: s.hours,
-      count: s.count, capacity: s.capacity, category: s.category || 'venue',
+      count: s.count, capacity: s.capacity, category: s.category || 'salon',
     };
   });
   res.json({ venues });
