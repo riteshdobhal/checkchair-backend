@@ -259,6 +259,7 @@ async function notifySubscriber(sub, venue, count) {
         data: {
           venueId:   venue.id,
           venueName: venue.name,
+          category:  venue.category || 'salon',
           screen:    'VenueDetail',
         },
         android: { priority: 'high', notification: { channelId: 'freechair-alerts', sound: 'default' } },
