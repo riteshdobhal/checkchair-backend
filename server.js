@@ -32,7 +32,7 @@ const messaging = getMessaging();
 console.log('✅ Firestore + FCM connected');
 
 const usersCol = db.collection('users');
-const salonsCol = db.collection('salons');
+const venuesCol = db.collection('venues');
 const subsCol  = db.collection('subscriptions');
 
 // ── Optional Twilio (WhatsApp backup) ───────────────────────────────────────────
@@ -46,11 +46,11 @@ if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────────
-const bizKey = (phone) => `salon_${phone.replace(/\D/g, '')}`;
-const subKey = (phone, salonId) => `${phone}_${salonId}`;
+const bizKey = (phone) => `venue_${phone.replace(/\D/g, '')}`;
+const subKey = (phone, venueId) => `${phone}_${venueId}`;
 
 // Default capacity per category (used when a new business is created)
-const DEFAULT_CAP = { salon: 6, restaurant: 20, clinic: 15, gym: 40, cafe: 15 };
+const DEFAULT_CAP = { venue: 6, restaurant: 20, clinic: 15, gym: 40, cafe: 15 };
 
 // ── Health check (for uptime ping — does NOT touch Firestore) ───────────────────
 app.get('/health', (req, res) => {
@@ -72,7 +72,7 @@ app.post('/auth/firebase-login', async (req, res) => {
   if (userSnap.exists) {
     user = userSnap.data();
   } else {
-    user = { id: phone, phone, firebaseUid: firebaseUid || '', name: '', role: null, salonId: null, category: null, fcmToken: null, createdAt: Date.now() };
+    user = { id: phone, phone, firebaseUid: firebaseUid || '', name: '', role: null, venueId: null, category: null, fcmToken: null, createdAt: Date.now() };
     await userRef.set(user);
   }
   res.json({ ok: true, user });
@@ -89,11 +89,11 @@ app.post('/auth/set-role', async (req, res) => {
   const updates = { name, role };
 
   if (role === 'owner') {
-    const cat      = category || 'salon';
+    const cat      = category || 'venue';
     const sid      = bizKey(phone);
-    const salonRef = salonsCol.doc(sid);
-    if (!(await salonRef.get()).exists) {
-      await salonRef.set({
+    const venueRef = venuesCol.doc(sid);
+    if (!(await venueRef.get()).exists) {
+      await venueRef.set({
         id: sid,
         name: `${name}'s ${cat}`,
         category: cat,
@@ -105,13 +105,13 @@ app.post('/auth/set-role', async (req, res) => {
         createdAt: Date.now(),
       });
     }
-    updates.salonId  = sid;
+    updates.venueId  = sid;
     updates.category = cat;
   }
 
   await userRef.update(updates);
   const updated = { ...userSnap.data(), ...updates };
-  res.json({ ok: true, user: updated, salonId: updated.salonId });
+  res.json({ ok: true, user: updated, venueId: updated.venueId });
 });
 
 // ── Save FCM device token ────────────────────────────────────────────────────────
@@ -123,41 +123,41 @@ app.post('/save-token', async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════════
-//  BUSINESSES (salons / restaurants / clinics / gyms / cafes)
+//  BUSINESSES (venues / restaurants / clinics / gyms / cafes)
 // ════════════════════════════════════════════════════════════════════════════════
 
-app.post('/salon/profile', async (req, res) => {
-  const { salonId, name, address, hours, capacity } = req.body;
-  if (!salonId) return res.status(400).json({ error: 'salonId required' });
-  await salonsCol.doc(salonId).set(
+app.post('/venue/profile', async (req, res) => {
+  const { venueId, name, address, hours, capacity } = req.body;
+  if (!venueId) return res.status(400).json({ error: 'venueId required' });
+  await venuesCol.doc(venueId).set(
     { name, address, hours, capacity: parseInt(capacity) || 6 },
     { merge: true }
   );
-  io.emit('salon_updated', { salonId, name, capacity: parseInt(capacity) || 6 });
+  io.emit('venue_updated', { venueId, name, capacity: parseInt(capacity) || 6 });
   res.json({ ok: true });
 });
 
-app.get('/salon/:salonId', async (req, res) => {
-  const snap = await salonsCol.doc(req.params.salonId).get();
-  if (!snap.exists) return res.status(404).json({ error: 'Salon not found' });
+app.get('/venue/:venueId', async (req, res) => {
+  const snap = await venuesCol.doc(req.params.venueId).get();
+  if (!snap.exists) return res.status(404).json({ error: 'Venue not found' });
   res.json(snap.data());
 });
 
 // List — optionally filtered by category (?category=restaurant)
-app.get('/salons', async (req, res) => {
+app.get('/venues', async (req, res) => {
   const { category } = req.query;
-  let query = salonsCol;
-  if (category) query = salonsCol.where('category', '==', category);
+  let query = venuesCol;
+  if (category) query = venuesCol.where('category', '==', category);
 
   const snap = await query.get();
-  const salons = snap.docs.map(d => {
+  const venues = snap.docs.map(d => {
     const s = d.data();
     return {
       id: s.id, name: s.name, address: s.address, hours: s.hours,
-      count: s.count, capacity: s.capacity, category: s.category || 'salon',
+      count: s.count, capacity: s.capacity, category: s.category || 'venue',
     };
   });
-  res.json({ salons });
+  res.json({ venues });
 });
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -165,27 +165,27 @@ app.get('/salons', async (req, res) => {
 // ════════════════════════════════════════════════════════════════════════════════
 
 app.post('/count', async (req, res) => {
-  const { count, salonId } = req.body;
-  console.log(`\n📊 COUNT UPDATE: salonId=${salonId}, count=${count}`);
-  if (salonId === undefined || count === undefined) return res.status(400).json({ error: 'count and salonId required' });
+  const { count, venueId } = req.body;
+  console.log(`\n📊 COUNT UPDATE: venueId=${venueId}, count=${count}`);
+  if (venueId === undefined || count === undefined) return res.status(400).json({ error: 'count and venueId required' });
 
-  const salonRef  = salonsCol.doc(salonId);
-  const salonSnap = await salonRef.get();
-  if (!salonSnap.exists) return res.status(404).json({ error: 'Salon not found' });
+  const venueRef  = venuesCol.doc(venueId);
+  const venueSnap = await venueRef.get();
+  if (!venueSnap.exists) return res.status(404).json({ error: 'Venue not found' });
 
-  const salon = salonSnap.data();
-  const prev  = salon.count;
-  await salonRef.update({ count });
-  io.emit('count_update', { count, salonId, capacity: salon.capacity });
+  const venue = venueSnap.data();
+  const prev  = venue.count;
+  await venueRef.update({ count });
+  io.emit('count_update', { count, venueId, capacity: venue.capacity });
 
   // Notify subscribers who just crossed their threshold (busy → quiet)
-  const subsSnap = await subsCol.where('salonId', '==', salonId).get();
+  const subsSnap = await subsCol.where('venueId', '==', venueId).get();
   console.log(`   Subscribers: ${subsSnap.size}`);
   for (const doc of subsSnap.docs) {
     const sub = doc.data();
     if (prev >= sub.threshold && count < sub.threshold) {
       console.log(`   ✅ Threshold crossed for ${sub.phone} — notifying`);
-      await notifySubscriber(sub, salon, count);
+      await notifySubscriber(sub, venue, count);
     }
   }
   res.json({ ok: true });
@@ -194,12 +194,12 @@ app.post('/count', async (req, res) => {
 app.get('/count', async (req, res) => {
   const { id } = req.query;
   if (!id) return res.json({ count: 0 });
-  const snap = await salonsCol.doc(id).get();
+  const snap = await venuesCol.doc(id).get();
   res.json({ count: snap.exists ? snap.data().count : 0, updatedAt: new Date().toISOString() });
 });
 
 // ── Notify one subscriber: FCM push first (free), WhatsApp backup (paid) ─────────
-async function notifySubscriber(sub, salon, count) {
+async function notifySubscriber(sub, venue, count) {
   const userSnap = await usersCol.doc(sub.phone).get();
   const fcmToken = userSnap.exists ? userSnap.data().fcmToken : null;
   console.log(`   📲 notify ${sub.phone}, hasToken=${!!fcmToken}`);
@@ -209,13 +209,13 @@ async function notifySubscriber(sub, salon, count) {
       await messaging.send({
         token: fcmToken,
         notification: {
-          title: `${salon.name} is quiet now!`,
+          title: `${venue.name} is quiet now!`,
           body:  `Only ${count} now. Come on in!`,
         },
         data: {
-          salonId:   salon.id,
-          salonName: salon.name,
-          screen:    'SalonDetail',
+          venueId:   venue.id,
+          venueName: venue.name,
+          screen:    'VenueDetail',
         },
         android: { priority: 'high', notification: { channelId: 'freechair-alerts', sound: 'default' } },
       });
@@ -229,7 +229,7 @@ async function notifySubscriber(sub, salon, count) {
   if (twilio) {
     await twilio.messages.create({
       from: WHATSAPP_FROM, to: `whatsapp:+91${sub.phone}`,
-      body: `Hi ${sub.name}! ${salon.name} now has only ${count} customer(s). Come on in! 💈`,
+      body: `Hi ${sub.name}! ${venue.name} now has only ${count} customer(s). Come on in! 💈`,
     }).then(() => console.log(`   ✅ WhatsApp sent to ${sub.phone}`))
       .catch(err => console.log(`   ❌ WhatsApp failed: ${err.message}`));
   }
@@ -240,14 +240,14 @@ async function notifySubscriber(sub, salon, count) {
 // ════════════════════════════════════════════════════════════════════════════════
 
 app.post('/subscribe', async (req, res) => {
-  const { phone, name, threshold = 3, salonId } = req.body;
-  if (!phone || !salonId) return res.status(400).json({ error: 'phone and salonId required' });
+  const { phone, name, threshold = 3, venueId } = req.body;
+  if (!phone || !venueId) return res.status(400).json({ error: 'phone and venueId required' });
 
-  const salonSnap = await salonsCol.doc(salonId).get();
-  if (!salonSnap.exists) return res.status(404).json({ error: 'Salon not found' });
+  const venueSnap = await venuesCol.doc(venueId).get();
+  if (!venueSnap.exists) return res.status(404).json({ error: 'Venue not found' });
 
-  await subsCol.doc(subKey(phone, salonId)).set({
-    phone, name: name || phone, threshold: parseInt(threshold), salonId, createdAt: Date.now(),
+  await subsCol.doc(subKey(phone, venueId)).set({
+    phone, name: name || phone, threshold: parseInt(threshold), venueId, createdAt: Date.now(),
   });
   res.json({ ok: true });
 });
@@ -257,10 +257,10 @@ app.get('/subscriptions/:phone', async (req, res) => {
   const subscriptions = [];
   for (const doc of snap.docs) {
     const sub      = doc.data();
-    const salonSnap = await salonsCol.doc(sub.salonId).get();
+    const venueSnap = await venuesCol.doc(sub.venueId).get();
     subscriptions.push({
-      salonId:   sub.salonId,
-      salonName: salonSnap.exists ? salonSnap.data().name : sub.salonId,
+      venueId:   sub.venueId,
+      venueName: venueSnap.exists ? venueSnap.data().name : sub.venueId,
       threshold: sub.threshold,
     });
   }
@@ -268,14 +268,14 @@ app.get('/subscriptions/:phone', async (req, res) => {
 });
 
 app.post('/unsubscribe', async (req, res) => {
-  const { phone, salonId } = req.body;
-  await subsCol.doc(subKey(phone, salonId)).delete();
+  const { phone, venueId } = req.body;
+  await subsCol.doc(subKey(phone, venueId)).delete();
   res.json({ ok: true });
 });
 
 // ── QR code ───────────────────────────────────────────────────────────────────
-app.get('/qr/:salonId', async (req, res) => {
-  const url = `${process.env.APP_URL || 'http://localhost:3000'}/salon/${req.params.salonId}`;
+app.get('/qr/:venueId', async (req, res) => {
+  const url = `${process.env.APP_URL || 'http://localhost:3000'}/venue/${req.params.venueId}`;
   const qr  = await QRCode.toBuffer(url, { width: 400, margin: 2 });
   res.set('Content-Type', 'image/png');
   res.send(qr);
@@ -284,10 +284,10 @@ app.get('/qr/:salonId', async (req, res) => {
 // ── WebSocket ──────────────────────────────────────────────────────────────────
 io.on('connection', async (socket) => {
   console.log('📱 Client connected');
-  const snap = await salonsCol.get();
+  const snap = await venuesCol.get();
   socket.emit('all_counts', snap.docs.map(d => {
     const s = d.data();
-    return { salonId: s.id, count: s.count, capacity: s.capacity };
+    return { venueId: s.id, count: s.count, capacity: s.capacity };
   }));
   socket.on('disconnect', () => console.log('📱 Client disconnected'));
 });
