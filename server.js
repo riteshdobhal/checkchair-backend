@@ -32,7 +32,7 @@ const messaging = getMessaging();
 console.log('✅ Firestore + FCM connected');
 
 const usersCol = db.collection('users');
-const venuesCol = db.collection('salons');
+const venuesCol = db.collection('venues');
 const subsCol  = db.collection('subscriptions');
 
 // ── Optional Twilio (WhatsApp backup) ───────────────────────────────────────────
