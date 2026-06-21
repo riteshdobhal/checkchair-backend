@@ -127,12 +127,11 @@ app.post('/save-token', async (req, res) => {
 // ════════════════════════════════════════════════════════════════════════════════
 
 app.post('/venue/profile', async (req, res) => {
-  const { venueId, name, address, hours, capacity } = req.body;
+  const { venueId, name, address, hours, capacity, phone } = req.body;
   if (!venueId) return res.status(400).json({ error: 'venueId required' });
-  await venuesCol.doc(venueId).set(
-    { name, address, hours, capacity: parseInt(capacity) || 6 },
-    { merge: true }
-  );
+  const update = { name, address, hours, capacity: parseInt(capacity) || 6 };
+  if (phone !== undefined) update.phone = phone.trim() || null;
+  await venuesCol.doc(venueId).set(update, { merge: true });
   io.emit('venue_updated', { venueId, name, capacity: parseInt(capacity) || 6 });
   res.json({ ok: true });
 });
@@ -155,7 +154,7 @@ app.get('/venues', async (req, res) => {
     return {
       id: s.id, name: s.name, address: s.address, hours: s.hours,
       count: s.count, capacity: s.capacity, category: s.category || 'salon',
-      ownerId: s.ownerId || null,
+      ownerId: s.ownerId || null, phone: s.phone || null,
     };
   });
   res.json({ venues });
