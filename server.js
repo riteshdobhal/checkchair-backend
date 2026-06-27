@@ -354,8 +354,8 @@ app.get('/venues', async (req, res) => {
         category:  s.category  || 'salon',
         ownerId:   s.ownerId   || null,
         phone:     s.phone     || null,
-        latitude:  s.latitude  ?? null,
-        longitude: s.longitude ?? null,
+        latitude:  s.lat ?? s.latitude  ?? null,
+        longitude: s.lng ?? s.longitude ?? null,
       };
     });
 
