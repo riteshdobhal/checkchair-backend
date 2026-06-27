@@ -279,7 +279,7 @@ app.post('/save-token', async (req, res) => {
  * Response: { ok: true }
  */
 app.post('/venue/profile', async (req, res) => {
-  const { venueId, name, address, hours, capacity, phone } = req.body;
+  const { venueId, name, address, hours, capacity, phone, latitude, longitude } = req.body;
   if (!venueId) return res.status(400).json({ error: 'venueId required' });
 
   try {
@@ -292,6 +292,10 @@ app.post('/venue/profile', async (req, res) => {
 
     // Allow clearing the venue contact phone (set to null) with an explicit empty string.
     if (phone !== undefined) update.phone = phone.trim() || null;
+
+    // Store coordinates as numbers, or null to clear them.
+    if (latitude !== undefined)  update.latitude  = latitude  !== null ? parseFloat(latitude)  : null;
+    if (longitude !== undefined) update.longitude = longitude !== null ? parseFloat(longitude) : null;
 
     await venuesCol.doc(venueId).set(update, { merge: true });
 
@@ -341,15 +345,17 @@ app.get('/venues', async (req, res) => {
     const venues = snap.docs.map(d => {
       const s = d.data();
       return {
-        id:       s.id,
-        name:     s.name,
-        address:  s.address,
-        hours:    s.hours,
-        count:    s.count,
-        capacity: s.capacity,
-        category: s.category || 'salon',
-        ownerId:  s.ownerId  || null,
-        phone:    s.phone    || null,
+        id:        s.id,
+        name:      s.name,
+        address:   s.address,
+        hours:     s.hours,
+        count:     s.count,
+        capacity:  s.capacity,
+        category:  s.category  || 'salon',
+        ownerId:   s.ownerId   || null,
+        phone:     s.phone     || null,
+        latitude:  s.latitude  ?? null,
+        longitude: s.longitude ?? null,
       };
     });
 
