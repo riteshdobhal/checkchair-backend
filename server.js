@@ -704,6 +704,138 @@ app.get('/qr/:venueId', async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════════
+//  VENUE SEEDING FROM USER LOCATION
+//  Called when a customer shares their GPS coordinates. Fetches nearby businesses
+//  from OpenStreetMap (Overpass API) and writes them to Firestore.
+//  Deduplication: OSM element IDs are used as Firestore doc IDs so the same
+//  business is never written twice regardless of how many users trigger this.
+// ════════════════════════════════════════════════════════════════════════════════
+
+const CATEGORY_OSM = {
+  salon:      [['shop', 'hairdresser'], ['shop', 'beauty'], ['amenity', 'beauty_salon']],
+  cafe:       [['amenity', 'cafe']],
+  gym:        [['leisure', 'fitness_centre'], ['leisure', 'sports_centre']],
+  restaurant: [['amenity', 'restaurant'], ['amenity', 'fast_food']],
+  clinic:     [['amenity', 'clinic'], ['amenity', 'doctors'], ['amenity', 'hospital']],
+};
+
+function buildOverpassQuery(lat, lng, radiusM) {
+  const parts = [];
+  for (const pairs of Object.values(CATEGORY_OSM)) {
+    for (const [k, v] of pairs) {
+      parts.push(`node["${k}"="${v}"](around:${radiusM},${lat},${lng});`);
+      parts.push(`way["${k}"="${v}"](around:${radiusM},${lat},${lng});`);
+    }
+  }
+  return `[out:json][timeout:60];(${parts.join('')});out center tags;`;
+}
+
+function osmCategoryOf(tags) {
+  for (const [catId, pairs] of Object.entries(CATEGORY_OSM)) {
+    for (const [k, v] of pairs) {
+      if (tags[k] === v) return catId;
+    }
+  }
+  return null;
+}
+
+function osmAddressOf(tags) {
+  return [
+    tags['addr:housenumber'],
+    tags['addr:street'],
+    tags['addr:suburb'] || tags['addr:neighbourhood'],
+    tags['addr:city'],
+  ].filter(Boolean).join(', ') || 'Address not set';
+}
+
+async function fetchOverpass(query) {
+  const ENDPOINTS = [
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.kumi.systems/api/interpreter',
+    'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+  ];
+  for (const url of ENDPOINTS) {
+    try {
+      const r = await fetch(url, {
+        method:  'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'User-Agent':   'CheckChair/1.0 (contact: dev@checkchair.app)',
+        },
+        body: 'data=' + encodeURIComponent(query),
+      });
+      if (r.ok) return r.json();
+    } catch { /* try next mirror */ }
+  }
+  throw new Error('All Overpass endpoints failed');
+}
+
+/**
+ * POST /venues/seed-from-location
+ * Fetches venues from OpenStreetMap within 10 km of the given coordinates and
+ * writes them to Firestore. Uses OSM element IDs as document IDs so the same
+ * business is never duplicated even if multiple users in the same area trigger this.
+ *
+ * Body: { lat: number, lng: number }
+ * Response: { ok: true, added: number, updated: number, skipped: number }
+ */
+app.post('/venues/seed-from-location', async (req, res) => {
+  const { lat, lng } = req.body;
+  if (lat == null || lng == null) {
+    return res.status(400).json({ error: 'lat and lng required' });
+  }
+
+  try {
+    const query    = buildOverpassQuery(lat, lng, 10000); // 10 km covers all filter options
+    const data     = await fetchOverpass(query);
+    const elements = data.elements || [];
+
+    let added = 0, updated = 0, skipped = 0;
+
+    for (const el of elements) {
+      const tags     = el.tags || {};
+      const name     = tags.name;
+      if (!name) { skipped++; continue; }
+
+      const category = osmCategoryOf(tags);
+      if (!category) { skipped++; continue; }
+
+      const elLat = el.lat ?? el.center?.lat ?? null;
+      const elLng = el.lon ?? el.center?.lon ?? null;
+
+      const id  = `osm_${el.type}_${el.id}`;
+      const ref = venuesCol.doc(id);
+      const existing = await ref.get();
+
+      const fields = {
+        id, name, category,
+        address:   osmAddressOf(tags),
+        hours:     tags.opening_hours || 'Hours not set',
+        capacity:  DEFAULT_CAP[category] || 6,
+        latitude:  elLat,
+        longitude: elLng,
+        source:    'osm',
+      };
+
+      if (!existing.exists) {
+        await ref.set({ ...fields, count: 0, ownerId: null, createdAt: Date.now() });
+        added++;
+      } else {
+        // Refresh address / hours / coords but preserve live count and ownerId
+        await ref.set(fields, { merge: true });
+        updated++;
+      }
+    }
+
+    console.log(`📍 seed-from-location (${lat},${lng}): +${added} new, ~${updated} refreshed, ${skipped} skipped`);
+    res.json({ ok: true, added, updated, skipped });
+  } catch (err) {
+    console.error('❌ /venues/seed-from-location error:', err);
+    res.status(500).json({ error: 'Failed to fetch venues from OpenStreetMap' });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════════
 //  WEBSOCKET
 //  On connection, immediately push a snapshot of all venue counts so the client
 //  doesn't need a separate HTTP call on startup.
