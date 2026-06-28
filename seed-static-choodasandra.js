@@ -78,7 +78,7 @@ const VENUES = [
   ['cli_01', 'Apollo Clinic HSR',       'clinic', '8, Sector 2, HSR Layout, Bangalore',          '8:00 AM – 8:00 PM', 15, 12.8837, 77.6886],
   ['cli_02', 'HealthFirst Clinic',      'clinic', '2nd Cross, Choodasandra, Bangalore',           '9:00 AM – 7:00 PM', 15, 12.8927, 77.6794],
   // ~2 km
-  ['cli_03', 'Dr. Sharma's Clinic',     'clinic', '17, 27th Main, HSR Layout, Bangalore',        '9:00 AM – 6:00 PM', 15, 12.8709, 77.6664],
+  ['cli_03', 'Dr. Sharma\'s Clinic',    'clinic', '17, 27th Main, HSR Layout, Bangalore',        '9:00 AM – 6:00 PM', 15, 12.8709, 77.6664],
   ['cli_04', 'Medix Health Centre',     'clinic', '40, Koramangala 6th Block, Bangalore',        '8:30 AM – 8:30 PM', 15, 12.8964, 77.6924],
   // ~3 km
   ['cli_05', 'City Care Clinic',        'clinic', '5, Agara Lake Rd, HSR Layout, Bangalore',     '9:00 AM – 8:00 PM', 15, 12.9028, 77.6984],
