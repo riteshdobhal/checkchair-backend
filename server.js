@@ -803,6 +803,11 @@ app.post('/venues/seed-from-location', async (req, res) => {
       const elLat = el.lat ?? el.center?.lat ?? null;
       const elLng = el.lon ?? el.center?.lon ?? null;
 
+      // Skip venues outside India (lat 8–37°N, lng 68–97°E)
+      if (elLat != null && (elLat < 8 || elLat > 37 || elLng < 68 || elLng > 97)) {
+        skipped++; continue;
+      }
+
       const id  = `osm_${el.type}_${el.id}`;
       const ref = venuesCol.doc(id);
       const existing = await ref.get();
