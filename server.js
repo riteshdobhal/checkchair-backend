@@ -22,6 +22,9 @@
 // ── Core dependencies ─────────────────────────────────────────────────────────
 const express   = require('express');
 const http      = require('http');
+const crypto    = require('crypto');
+const fs        = require('fs');
+const path      = require('path');
 const { Server } = require('socket.io');
 const QRCode    = require('qrcode');
 require('dotenv').config();
@@ -39,6 +42,98 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
 app.use(express.json());
+
+// ── Structured logging / telemetry ───────────────────────────────────────────
+const SENSITIVE_KEY = /phone|token|otp|uid|firebase|password|secret/i;
+const COORDINATE_KEY = /^(lat|lng|latitude|longitude)$/i;
+
+function sanitizeLogValue(key, value) {
+  if (SENSITIVE_KEY.test(key)) return '[redacted]';
+  if (COORDINATE_KEY.test(key) && typeof value === 'number') return Number(value.toFixed(3));
+  if (typeof value === 'string' && value.length > 180) return `${value.slice(0, 177)}...`;
+  if (value instanceof Error) return { name: value.name, message: value.message };
+  return value;
+}
+
+function sanitizeLogProperties(properties = {}) {
+  return Object.entries(properties).reduce((acc, [key, value]) => {
+    acc[key] = sanitizeLogValue(key, value);
+    return acc;
+  }, {});
+}
+
+// ── File logger (daily rotating, 7-day retention) ────────────────────────────
+const LOG_DIR        = path.join(__dirname, 'logs');
+const LOG_RETENTION  = 7; // days to keep
+
+// Ensure logs/ directory exists
+if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+
+// Delete log files older than LOG_RETENTION days
+function pruneOldLogs() {
+  try {
+    const cutoff = Date.now() - LOG_RETENTION * 24 * 60 * 60 * 1000;
+    for (const file of fs.readdirSync(LOG_DIR)) {
+      if (!file.endsWith('.log')) continue;
+      const fullPath = path.join(LOG_DIR, file);
+      const { mtimeMs } = fs.statSync(fullPath);
+      if (mtimeMs < cutoff) fs.unlinkSync(fullPath);
+    }
+  } catch { /* non-fatal */ }
+}
+pruneOldLogs();
+
+// Returns the file path for today's log, e.g. logs/app-2026-07-05.log
+function todayLogPath() {
+  const d = new Date();
+  const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  return path.join(LOG_DIR, `app-${dateStr}.log`);
+}
+
+function writeToFile(line) {
+  try {
+    fs.appendFileSync(todayLogPath(), line + '\n', 'utf8');
+  } catch { /* never crash on log failure */ }
+}
+
+function log(level, event, properties = {}) {
+  const payload = {
+    ts: new Date().toISOString(),
+    level,
+    event,
+    ...sanitizeLogProperties(properties),
+  };
+  const line = JSON.stringify(payload);
+  const writer = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
+  writer(line);
+  writeToFile(line);
+}
+
+function logInfo(event, properties) { log('info', event, properties); }
+function logWarn(event, properties) { log('warn', event, properties); }
+function logError(event, err, properties = {}) {
+  log('error', event, {
+    ...properties,
+    errorName: err?.name || 'Error',
+    errorMessage: err?.message || String(err),
+    ...(process.env.NODE_ENV !== 'production' && err?.stack ? { stack: err.stack } : {}),
+  });
+}
+
+app.use((req, res, next) => {
+  const startedAt = Date.now();
+  req.requestId = crypto.randomUUID();
+  res.on('finish', () => {
+    logInfo('http_request', {
+      requestId: req.requestId,
+      method: req.method,
+      path: req.path,
+      status: res.statusCode,
+      durationMs: Date.now() - startedAt,
+    });
+  });
+  next();
+});
 
 // ════════════════════════════════════════════════════════════════════════════════
 //  FIREBASE INITIALISATION
@@ -59,7 +154,7 @@ initializeApp({ credential: cert(serviceAccount) });
 
 const db        = getFirestore();
 const messaging = getMessaging();
-console.log('✅ Firestore + FCM connected');
+logInfo('firebase_connected');
 
 // ── Firestore collection references ───────────────────────────────────────────
 const usersCol  = db.collection('users');
@@ -81,9 +176,9 @@ if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
     process.env.TWILIO_ACCOUNT_SID,
     process.env.TWILIO_AUTH_TOKEN
   );
-  console.log('✅ Twilio loaded — WhatsApp backup enabled');
+  logInfo('twilio_enabled');
 } else {
-  console.log('⚠️  Twilio not configured — using FCM push only');
+  logWarn('twilio_not_configured');
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -136,6 +231,26 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, status: 'awake', time: new Date().toISOString() });
 });
 
+/**
+ * POST /telemetry
+ * Receives fire-and-forget client telemetry events from the mobile app.
+ * Events are logged only; they are not persisted, and sensitive fields are redacted.
+ */
+app.post('/telemetry', (req, res) => {
+  const { event, level = 'info', properties = {}, sessionId, platform, timestamp } = req.body || {};
+  if (!event) return res.status(400).json({ error: 'event required' });
+
+  const logLevel = ['info', 'warn', 'error'].includes(level) ? level : 'info';
+  log(logLevel, 'client_telemetry', {
+    clientEvent: event,
+    sessionId,
+    platform,
+    clientTimestamp: timestamp,
+    ...properties,
+  });
+  res.json({ ok: true });
+});
+
 // ════════════════════════════════════════════════════════════════════════════════
 //  AUTH
 //  Firebase handles OTP verification client-side; the backend only creates or
@@ -178,9 +293,10 @@ app.post('/auth/firebase-login', async (req, res) => {
       await userRef.set(user);
     }
 
+    logInfo('auth_firebase_login_success', { phone, existingUser: userSnap.exists, role: user.role });
     res.json({ ok: true, user });
   } catch (err) {
-    console.error('❌ /auth/firebase-login error:', err);
+    logError('auth_firebase_login_failed', err, { phone });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -232,9 +348,10 @@ app.post('/auth/set-role', async (req, res) => {
 
     await userRef.update(updates);
     const updated = { ...userSnap.data(), ...updates };
+    logInfo('auth_role_set', { phone, role, category: updated.category || category || null, venueId: updated.venueId || null });
     res.json({ ok: true, user: updated, venueId: updated.venueId });
   } catch (err) {
-    console.error('❌ /auth/set-role error:', err);
+    logError('auth_role_set_failed', err, { phone, role, category });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -255,9 +372,10 @@ app.post('/save-token', async (req, res) => {
 
   try {
     await usersCol.doc(phone).set({ fcmToken: token }, { merge: true });
+    logInfo('fcm_token_saved', { phone, hasToken: Boolean(token) });
     res.json({ ok: true });
   } catch (err) {
-    console.error('❌ /save-token error:', err);
+    logError('fcm_token_save_failed', err, { phone });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -302,9 +420,10 @@ app.post('/venue/profile', async (req, res) => {
     // Notify all connected clients so they can update venue info in real time.
     io.emit('venue_updated', { venueId, name, capacity: parseInt(capacity) || 6 });
 
+    logInfo('venue_profile_updated', { venueId, capacity: parseInt(capacity) || 6, hasPhone: Boolean(phone), hasCoordinates: latitude !== undefined && longitude !== undefined });
     res.json({ ok: true });
   } catch (err) {
-    console.error('❌ /venue/profile error:', err);
+    logError('venue_profile_update_failed', err, { venueId });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -319,9 +438,10 @@ app.get('/venue/:venueId', async (req, res) => {
   try {
     const snap = await venuesCol.doc(req.params.venueId).get();
     if (!snap.exists) return res.status(404).json({ error: 'Venue not found' });
+    logInfo('venue_detail_loaded', { venueId: req.params.venueId });
     res.json(snap.data());
   } catch (err) {
-    console.error('❌ /venue/:venueId error:', err);
+    logError('venue_detail_load_failed', err, { venueId: req.params.venueId });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -359,9 +479,10 @@ app.get('/venues', async (req, res) => {
       };
     });
 
+    logInfo('venues_listed', { category: category || null, count: venues.length });
     res.json({ venues });
   } catch (err) {
-    console.error('❌ /venues error:', err);
+    logError('venues_list_failed', err, { category });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -397,9 +518,10 @@ app.get('/venues/claimable', async (req, res) => {
         category: s.category || 'salon',
       }));
 
+    logInfo('venues_claimable_listed', { category: category || null, count: venues.length });
     res.json({ venues });
   } catch (err) {
-    console.error('❌ /venues/claimable error:', err);
+    logError('venues_claimable_list_failed', err, { category });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -439,9 +561,10 @@ app.post('/venue/claim', async (req, res) => {
     });
 
     const userSnap = await usersCol.doc(phone).get();
+    logInfo('venue_claimed', { phone, venueId, category: venue.category || 'salon' });
     res.json({ ok: true, venue: { ...venue, ownerId: phone }, user: userSnap.data() });
   } catch (err) {
-    console.error('❌ /venue/claim error:', err);
+    logError('venue_claim_failed', err, { phone, venueId });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -466,7 +589,6 @@ app.post('/venue/claim', async (req, res) => {
  */
 app.post('/count', async (req, res) => {
   const { count, venueId } = req.body;
-  console.log(`\n📊 COUNT UPDATE: venueId=${venueId}, count=${count}`);
 
   if (venueId === undefined || count === undefined) {
     return res.status(400).json({ error: 'count and venueId required' });
@@ -488,20 +610,21 @@ app.post('/count', async (req, res) => {
     // Only notify subscribers when the count crosses their threshold downward
     // (i.e. they were waiting for it to get quieter).
     const subsSnap = await subsCol.where('venueId', '==', venueId).get();
-    console.log(`   Subscribers: ${subsSnap.size}`);
+    let notificationsTriggered = 0;
 
     for (const doc of subsSnap.docs) {
       const sub = doc.data();
       // Threshold crossing: was above threshold, now at or below it.
       if (prev >= sub.threshold && count < sub.threshold) {
-        console.log(`   ✅ Threshold crossed for ${sub.phone} — notifying`);
+        notificationsTriggered++;
         await notifySubscriber(sub, venue, count);
       }
     }
 
+    logInfo('count_updated', { venueId, previousCount: prev, count, capacity: venue.capacity, subscribers: subsSnap.size, notificationsTriggered });
     res.json({ ok: true });
   } catch (err) {
-    console.error('❌ /count POST error:', err);
+    logError('count_update_failed', err, { venueId, count });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -525,7 +648,7 @@ app.get('/count', async (req, res) => {
       updatedAt: new Date().toISOString(),
     });
   } catch (err) {
-    console.error('❌ /count GET error:', err);
+    logError('count_load_failed', err, { venueId: id });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -545,7 +668,7 @@ app.get('/count', async (req, res) => {
 async function notifySubscriber(sub, venue, count) {
   const userSnap = await usersCol.doc(sub.phone).get();
   const fcmToken = userSnap.exists ? userSnap.data().fcmToken : null;
-  console.log(`   📲 notify ${sub.phone}, hasToken=${!!fcmToken}`);
+  logInfo('subscriber_notification_started', { phone: sub.phone, venueId: sub.venueId, hasToken: Boolean(fcmToken), count });
 
   if (fcmToken) {
     try {
@@ -567,11 +690,11 @@ async function notifySubscriber(sub, venue, count) {
           notification: { channelId: 'freechair-alerts', sound: 'default' },
         },
       });
-      console.log(`   ✅ FCM push sent to ${sub.phone}`);
+      logInfo('subscriber_notification_fcm_sent', { phone: sub.phone, venueId: sub.venueId });
       return; // FCM succeeded — no need for WhatsApp fallback.
     } catch (err) {
       // FCM can fail if the token is stale (app reinstalled, etc.) — try WhatsApp.
-      console.log(`   ❌ FCM failed, trying WhatsApp: ${err.message}`);
+      logError('subscriber_notification_fcm_failed', err, { phone: sub.phone, venueId: sub.venueId });
     }
   }
 
@@ -583,8 +706,10 @@ async function notifySubscriber(sub, venue, count) {
         to:   `whatsapp:+91${sub.phone}`,
         body: `Hi ${sub.name}! ${venue.name} now has only ${count} customer(s). Come on in! 💈`,
       })
-      .then(() => console.log(`   ✅ WhatsApp sent to ${sub.phone}`))
-      .catch(err => console.log(`   ❌ WhatsApp failed: ${err.message}`));
+      .then(() => logInfo('subscriber_notification_whatsapp_sent', { phone: sub.phone, venueId: sub.venueId }))
+      .catch(err => logError('subscriber_notification_whatsapp_failed', err, { phone: sub.phone, venueId: sub.venueId }));
+  } else {
+    logWarn('subscriber_notification_no_delivery_channel', { phone: sub.phone, venueId: sub.venueId });
   }
 }
 
@@ -621,9 +746,10 @@ app.post('/subscribe', async (req, res) => {
       createdAt: Date.now(),
     });
 
+    logInfo('subscription_created', { phone, venueId, threshold: parseInt(threshold) });
     res.json({ ok: true });
   } catch (err) {
-    console.error('❌ /subscribe error:', err);
+    logError('subscription_create_failed', err, { phone, venueId, threshold });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -650,9 +776,10 @@ app.get('/subscriptions/:phone', async (req, res) => {
       });
     }
 
+    logInfo('subscriptions_listed', { phone: req.params.phone, count: subscriptions.length });
     res.json({ subscriptions });
   } catch (err) {
-    console.error('❌ /subscriptions/:phone error:', err);
+    logError('subscriptions_list_failed', err, { phone: req.params.phone });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -672,9 +799,10 @@ app.post('/unsubscribe', async (req, res) => {
 
   try {
     await subsCol.doc(subKey(phone, venueId)).delete();
+    logInfo('subscription_removed', { phone, venueId });
     res.json({ ok: true });
   } catch (err) {
-    console.error('❌ /unsubscribe error:', err);
+    logError('subscription_remove_failed', err, { phone, venueId });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -696,9 +824,10 @@ app.get('/qr/:venueId', async (req, res) => {
     const url     = `${baseUrl}/venue/${req.params.venueId}`;
     const qr      = await QRCode.toBuffer(url, { width: 400, margin: 2 });
     res.set('Content-Type', 'image/png');
+    logInfo('qr_generated', { venueId: req.params.venueId });
     res.send(qr);
   } catch (err) {
-    console.error('❌ /qr/:venueId error:', err);
+    logError('qr_generate_failed', err, { venueId: req.params.venueId });
     res.status(500).json({ error: 'Failed to generate QR code' });
   }
 });
@@ -832,10 +961,10 @@ app.post('/venues/seed-from-location', async (req, res) => {
       }
     }
 
-    console.log(`📍 seed-from-location (${lat},${lng}): +${added} new, ~${updated} refreshed, ${skipped} skipped`);
+    logInfo('venues_seeded_from_location', { lat, lng, added, updated, skipped, totalElements: elements.length });
     res.json({ ok: true, added, updated, skipped });
   } catch (err) {
-    console.error('❌ /venues/seed-from-location error:', err);
+    logError('venues_seed_from_location_failed', err, { lat, lng });
     res.status(500).json({ error: 'Failed to fetch venues from OpenStreetMap' });
   }
 });
@@ -847,20 +976,22 @@ app.post('/venues/seed-from-location', async (req, res) => {
 // ════════════════════════════════════════════════════════════════════════════════
 
 io.on('connection', async (socket) => {
-  console.log('📱 Client connected');
+  logInfo('websocket_connected', { socketId: socket.id });
 
   try {
     // Send the full occupancy snapshot to the newly connected client.
     const snap = await venuesCol.get();
-    socket.emit('all_counts', snap.docs.map(d => {
+    const counts = snap.docs.map(d => {
       const s = d.data();
       return { venueId: s.id, count: s.count, capacity: s.capacity };
-    }));
+    });
+    socket.emit('all_counts', counts);
+    logInfo('websocket_initial_counts_sent', { socketId: socket.id, count: counts.length });
   } catch (err) {
-    console.error('❌ WebSocket initial snapshot error:', err);
+    logError('websocket_initial_counts_failed', err, { socketId: socket.id });
   }
 
-  socket.on('disconnect', () => console.log('📱 Client disconnected'));
+  socket.on('disconnect', (reason) => logInfo('websocket_disconnected', { socketId: socket.id, reason }));
 });
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -868,6 +999,5 @@ io.on('connection', async (socket) => {
 // ════════════════════════════════════════════════════════════════════════════════
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`\n🚀 CheckChair backend running on port ${PORT}`);
-  console.log('   Multi-vertical + FCM push + WhatsApp backup\n');
+  logInfo('server_started', { port: PORT, websocket: true, fcm: true, whatsappFallback: Boolean(twilio) });
 });
