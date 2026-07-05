@@ -182,6 +182,22 @@ if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
+//  ASSISTANT LLM PROVIDER (OPTIONAL)
+//  Powers the natural-language assistant ("show me open salons and alert me at the
+//  nearest one"). Intent parsing is simple, so any of several backends work — the
+//  first configured key wins:
+//    ANTHROPIC_API_KEY → Claude (paid)
+//    GROQ_API_KEY       → Groq   (free tier)
+//    GEMINI_API_KEY     → Gemini (free tier)
+//    (none)             → built-in keyword parser (no key, no network)
+// ════════════════════════════════════════════════════════════════════════════════
+
+const { parseAssistantIntent, assistantProvider } = require('./lib/assistantIntent');
+
+const _assistantProvider = assistantProvider();
+(_assistantProvider === 'keyword' ? logWarn : logInfo)('assistant_provider', { provider: _assistantProvider });
+
+// ════════════════════════════════════════════════════════════════════════════════
 //  CONSTANTS & HELPERS
 // ════════════════════════════════════════════════════════════════════════════════
 
@@ -803,6 +819,149 @@ app.post('/unsubscribe', async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     logError('subscription_remove_failed', err, { phone, venueId });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  NATURAL-LANGUAGE ASSISTANT
+//  Turns a plain-English request ("show me open salons and alert me at the nearest
+//  one") into an action: filter to venues with free seats, then subscribe the user
+//  to the nearest one so they get a push notification without watching the app.
+// ════════════════════════════════════════════════════════════════════════════════
+
+const DEFAULT_ASSISTANT_THRESHOLD = 3;
+
+/** Great-circle distance in km between two lat/lng points (haversine). */
+function distanceKm(lat1, lng1, lat2, lng2) {
+  const R = 6371;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+/**
+ * POST /assistant/nearest-available
+ * Natural-language entry point. Given a plain-English request and the user's
+ * location, finds venues in a category that currently have free seats and — when
+ * asked — subscribes the user to the nearest one.
+ *
+ * Body: { phone, name?, category, text, coords?: { lat, lng } }
+ * Response: {
+ *   ok, understood, message,
+ *   subscribed: VenueResult | null,     // the venue we subscribed the user to
+ *   available:  VenueResult[],          // open venues, nearest first
+ * }
+ * VenueResult: { venueId, venueName, count, capacity, availableNow, distanceKm|null, threshold? }
+ */
+app.post('/assistant/nearest-available', async (req, res) => {
+  const { phone, name, category, text, coords } = req.body;
+  if (!phone || !category || !text) {
+    return res.status(400).json({ error: 'phone, category and text required' });
+  }
+
+  try {
+    const categoryLabel = `${category}s`;
+    const understood    = await parseAssistantIntent(text, categoryLabel, {
+      onError: (err) => logError('assistant_parse_llm_failed', err),
+    });
+    logInfo('assistant_query', { phone, category, intent: understood.intent, source: understood.source, hasCoords: Boolean(coords) });
+
+    if (understood.intent === 'unsupported') {
+      return res.json({
+        ok: true,
+        understood,
+        subscribed: null,
+        available: [],
+        message: "Sorry, I can only find open venues near you and set up alerts. Try: “show me open venues and alert me at the nearest one”.",
+      });
+    }
+
+    // Load venues in this category and shape them for the response.
+    const snap    = await venuesCol.where('category', '==', category).get();
+    const hasHere = coords && Number.isFinite(coords.lat) && Number.isFinite(coords.lng);
+
+    const venues = snap.docs.map((d) => {
+      const v   = d.data();
+      const lat = v.lat ?? v.latitude  ?? null;
+      const lng = v.lng ?? v.longitude ?? null;
+      return {
+        venueId:      v.id,
+        venueName:    v.name,
+        count:        v.count,
+        capacity:     v.capacity,
+        availableNow: v.count < v.capacity,
+        distanceKm:   hasHere && lat != null && lng != null
+          ? Number(distanceKm(coords.lat, coords.lng, lat, lng).toFixed(2))
+          : null,
+      };
+    });
+
+    // Open venues only (when the user asked for that), nearest first.
+    const available = venues
+      .filter((v) => (understood.availableOnly ? v.availableNow : true))
+      .sort((a, b) => (a.distanceKm ?? Infinity) - (b.distanceKm ?? Infinity));
+
+    // List-only intent: just return the open venues.
+    if (understood.intent === 'list_available') {
+      return res.json({
+        ok: true,
+        understood,
+        subscribed: null,
+        available,
+        message: available.length
+          ? `Found ${available.length} ${categoryLabel} with seats available.`
+          : `No ${categoryLabel} with free seats right now.`,
+      });
+    }
+
+    // subscribe_nearest — need a place to subscribe to.
+    if (available.length === 0) {
+      return res.json({
+        ok: true,
+        understood,
+        subscribed: null,
+        available,
+        message: `No ${categoryLabel} with free seats right now — nothing to subscribe you to yet.`,
+      });
+    }
+    if (!hasHere) {
+      return res.json({
+        ok: true,
+        understood,
+        subscribed: null,
+        available,
+        message: 'Share your location so I can pick the nearest venue to subscribe you to.',
+      });
+    }
+
+    const nearest   = available[0];
+    const threshold = understood.threshold > 0 ? understood.threshold : DEFAULT_ASSISTANT_THRESHOLD;
+
+    await subsCol.doc(subKey(phone, nearest.venueId)).set({
+      phone,
+      name:      name || phone,
+      threshold,
+      venueId:   nearest.venueId,
+      createdAt: Date.now(),
+    });
+    logInfo('assistant_subscribed', { phone, venueId: nearest.venueId, threshold });
+
+    return res.json({
+      ok: true,
+      understood,
+      subscribed: { ...nearest, threshold },
+      available,
+      message: nearest.availableNow
+        ? `${nearest.venueName} has seats now, and I'll alert you whenever it has fewer than ${threshold} people.`
+        : `I'll alert you when ${nearest.venueName} drops below ${threshold} people.`,
+    });
+  } catch (err) {
+    logError('assistant_query_failed', err, { phone, category });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
