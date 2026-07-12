@@ -904,7 +904,7 @@ app.post('/assistant/nearest-available', async (req, res) => {
     const snap    = await venuesCol.where('category', '==', category).get();
     const hasHere = coords && Number.isFinite(coords.lat) && Number.isFinite(coords.lng);
 
-    const venues = snap.docs.map((d) => {
+    let venues = snap.docs.map((d) => {
       const v   = d.data();
       const lat = v.lat ?? v.latitude  ?? null;
       const lng = v.lng ?? v.longitude ?? null;
@@ -920,6 +920,25 @@ app.post('/assistant/nearest-available', async (req, res) => {
       };
     });
 
+    // Narrow to a specific venue when the customer named one (e.g. "show me only
+    // New Classic Salon") — otherwise every question defaults to the generic
+    // nearby list, which ignores what they actually asked.
+    const namedVenue = Boolean(understood.venueName);
+    if (namedVenue) {
+      const needle = understood.venueName.toLowerCase();
+      venues = venues.filter((v) => v.venueName && v.venueName.toLowerCase().includes(needle));
+
+      if (venues.length === 0) {
+        return res.json({
+          ok: true,
+          understood,
+          subscribed: null,
+          available: [],
+          message: `I couldn't find a ${category} called "${understood.venueName}" nearby.`,
+        });
+      }
+    }
+
     // Open venues only (when the user asked for that), nearest first.
     const available = venues
       .filter((v) => (understood.availableOnly ? v.availableNow : true))
@@ -927,15 +946,18 @@ app.post('/assistant/nearest-available', async (req, res) => {
 
     // List-only intent: just return the open venues.
     if (understood.intent === 'list_available') {
-      return res.json({
-        ok: true,
-        understood,
-        subscribed: null,
-        available,
-        message: available.length
+      let message;
+      if (namedVenue) {
+        const v = available[0] || venues[0];
+        message = available.length
+          ? `${v.venueName} has ${v.count}/${v.capacity} right now.`
+          : `${v.venueName} has no free seats right now.`;
+      } else {
+        message = available.length
           ? `Found ${available.length} ${categoryLabel} with seats available.`
-          : `No ${categoryLabel} with free seats right now.`,
-      });
+          : `No ${categoryLabel} with free seats right now.`;
+      }
+      return res.json({ ok: true, understood, subscribed: null, available, message });
     }
 
     // subscribe_nearest — need a place to subscribe to.
@@ -945,7 +967,9 @@ app.post('/assistant/nearest-available', async (req, res) => {
         understood,
         subscribed: null,
         available,
-        message: `No ${categoryLabel} with free seats right now — nothing to subscribe you to yet.`,
+        message: namedVenue
+          ? `${venues[0].venueName} has no free seats right now — nothing to subscribe you to yet.`
+          : `No ${categoryLabel} with free seats right now — nothing to subscribe you to yet.`,
       });
     }
     if (!hasHere) {
