@@ -25,6 +25,7 @@ const http      = require('http');
 const crypto    = require('crypto');
 const fs        = require('fs');
 const path      = require('path');
+const multer    = require('multer');
 const { Server } = require('socket.io');
 const QRCode    = require('qrcode');
 require('dotenv').config();
@@ -196,6 +197,24 @@ const { parseAssistantIntent, assistantProvider } = require('./lib/assistantInte
 
 const _assistantProvider = assistantProvider();
 (_assistantProvider === 'keyword' ? logWarn : logInfo)('assistant_provider', { provider: _assistantProvider });
+
+// ════════════════════════════════════════════════════════════════════════════════
+//  SPEECH-TO-TEXT (Sarvam AI)
+// ────────────────────────────────────────────────────────────────────────────────
+//  Powers the mic button in the customer app's assistant search bar. Sarvam's
+//  Saaras/Saarika models are purpose-built for Indian-language ASR — set
+//  SARVAM_API_KEY to enable; the mic button is hidden client-side when it's absent
+//  (see GET /stt/enabled below).
+// ════════════════════════════════════════════════════════════════════════════════
+
+const { transcribeAudio, sttEnabled } = require('./lib/sarvamStt');
+
+const sttUpload = multer({
+  storage: multer.memoryStorage(),
+  limits:  { fileSize: 15 * 1024 * 1024 }, // 15 MB — plenty for a short voice query
+});
+
+logInfo('stt_provider', { provider: sttEnabled() ? 'sarvam' : 'disabled' });
 
 // ════════════════════════════════════════════════════════════════════════════════
 //  CONSTANTS & HELPERS
@@ -963,6 +982,51 @@ app.post('/assistant/nearest-available', async (req, res) => {
   } catch (err) {
     logError('assistant_query_failed', err, { phone, category });
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /stt/enabled
+ * Lets the client know whether voice input should be offered at all — the mic
+ * button stays hidden if no SARVAM_API_KEY is configured on this deployment.
+ */
+app.get('/stt/enabled', (req, res) => {
+  res.json({ enabled: sttEnabled() });
+});
+
+/**
+ * POST /stt/transcribe
+ * Transcribes a short recorded voice clip via Sarvam AI. Used by the customer
+ * app's assistant mic button in place of on-device speech recognition, which
+ * handles regional Indian languages (Kannada, Telugu, Tamil) inconsistently.
+ *
+ * Body: multipart/form-data
+ *   file          — the recorded audio clip (m4a/wav/webm, <15 MB)
+ *   languageCode  — optional BCP-47 code, e.g. "hi-IN" (omit to auto-detect)
+ *
+ * Response: { ok, transcript, languageCode }
+ */
+app.post('/stt/transcribe', sttUpload.single('file'), async (req, res) => {
+  if (!sttEnabled()) {
+    return res.status(503).json({ error: 'Speech-to-text is not configured on this server' });
+  }
+  if (!req.file) {
+    return res.status(400).json({ error: 'file required' });
+  }
+
+  const languageCode = req.body.languageCode;
+  try {
+    const { transcript, languageCode: detected } = await transcribeAudio(
+      req.file.buffer,
+      req.file.originalname,
+      req.file.mimetype,
+      languageCode,
+    );
+    logInfo('stt_transcribe', { languageCode: languageCode || 'auto', detected, chars: transcript.length });
+    res.json({ ok: true, transcript, languageCode: detected });
+  } catch (err) {
+    logError('stt_transcribe_failed', err, { languageCode: languageCode || 'auto' });
+    res.status(502).json({ error: 'Transcription failed' });
   }
 });
 
