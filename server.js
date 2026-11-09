@@ -163,6 +163,128 @@ const venuesCol = db.collection('venues');
 const subsCol   = db.collection('subscriptions');
 
 // ════════════════════════════════════════════════════════════════════════════════
+//  VENUE READ CACHE
+//  `venuesCol.get()` costs one Firestore read *per document*, so serving the
+//  venue list straight from Firestore made every customer poll (and every
+//  WebSocket connect) cost a full collection scan. On the Spark free plan that
+//  exhausts the 50k reads/day allowance within minutes and every subsequent
+//  query fails with RESOURCE_EXHAUSTED — the whole app goes dark.
+//
+//  The venue list is small and changes rarely, so one process-wide snapshot is
+//  shared by every reader. Live counts stay correct because /count patches the
+//  cached entry in place (and broadcasts over WebSocket) rather than refetching.
+//
+//  Sizing the TTL — this is a read budget, not a freshness preference:
+//
+//      reads/day  ≈  (86400 / TTL_seconds) × venue_count
+//
+//  The Spark free plan allows 50,000 reads/day, so with ~1,000 venues a 60 s
+//  TTL would still cost ~720k reads/day and blow the quota. At 30 minutes the
+//  same collection costs ~48 scans/day (~48k reads), which fits.
+//
+//  A long TTL is safe here because every in-app mutation already keeps the
+//  snapshot correct: /count and /venue/profile patch it in place, and claims,
+//  owner signup and OSM seeding invalidate it. The TTL therefore only bounds
+//  staleness from *out-of-band* edits — the Firebase console, or the seed
+//  scripts in this directory.
+//
+//  Override with VENUE_CACHE_TTL_MS when moving off the free plan.
+// ════════════════════════════════════════════════════════════════════════════════
+
+const VENUE_CACHE_TTL_MS = Number(process.env.VENUE_CACHE_TTL_MS) || 30 * 60_000;
+
+// Hard cap on how many OSM venues a single seed request may write. One write per
+// element is what makes a dense-city seed blow the daily write allowance.
+const VENUE_SEED_MAX_ELEMENTS = 400;
+
+let venueCache = { venues: null, fetchedAt: 0 };
+let venueCacheInFlight = null;   // dedupes concurrent refills (see getAllVenues)
+
+/** Shapes a raw Firestore venue document into the summary clients consume. */
+function shapeVenue(s) {
+  return {
+    id:        s.id,
+    name:      s.name,
+    address:   s.address,
+    hours:     s.hours,
+    count:     s.count,
+    capacity:  s.capacity,
+    category:  s.category  || 'salon',
+    ownerId:   s.ownerId   || null,
+    phone:     s.phone     || null,
+    latitude:  s.lat ?? s.latitude  ?? null,
+    longitude: s.lng ?? s.longitude ?? null,
+  };
+}
+
+/**
+ * Returns every venue, served from the in-process cache when it is still fresh.
+ * Only a cache miss costs Firestore reads.
+ *
+ * Concurrent callers that arrive on a cold cache share a single refill rather
+ * than each starting their own scan — without this, a Render cold start with
+ * several clients connecting at once would multiply the read cost by the number
+ * of simultaneous requests, which is exactly when the quota is most at risk.
+ *
+ * @returns {Promise<object[]>} Venue summaries.
+ */
+async function getAllVenues() {
+  if (venueCache.venues && Date.now() - venueCache.fetchedAt < VENUE_CACHE_TTL_MS) {
+    return venueCache.venues;
+  }
+  if (venueCacheInFlight) return venueCacheInFlight;
+
+  venueCacheInFlight = (async () => {
+    const snap   = await venuesCol.get();
+    const venues = snap.docs.map(d => shapeVenue(d.data()));
+    venueCache   = { venues, fetchedAt: Date.now() };
+    logInfo('venue_cache_filled', { count: venues.length, reads: snap.size });
+    return venues;
+  })();
+
+  try {
+    return await venueCacheInFlight;
+  } finally {
+    venueCacheInFlight = null;
+  }
+}
+
+/** Drops the cached snapshot so the next read refetches (use after bulk writes). */
+function invalidateVenueCache(reason) {
+  venueCache = { venues: null, fetchedAt: 0 };
+  logInfo('venue_cache_invalidated', { reason });
+}
+
+/**
+ * Applies a field patch to one cached venue, keeping the snapshot current
+ * without spending a Firestore read. No-op when the cache is empty.
+ */
+function patchVenueCache(venueId, patch) {
+  if (!venueCache.venues) return;
+  venueCache.venues = venueCache.venues.map(v => (v.id === venueId ? { ...v, ...patch } : v));
+}
+
+/**
+ * True when a Firestore error is a quota/rate-limit rejection (gRPC code 8).
+ * Worth distinguishing: it is transient and operational, not a code bug, and
+ * clients should say so instead of rendering an empty list.
+ */
+function isQuotaError(err) {
+  return err?.code === 8 || /RESOURCE_EXHAUSTED|Quota exceeded/i.test(err?.message || '');
+}
+
+/** Sends 503 + QUOTA_EXCEEDED for quota failures, 500 otherwise. */
+function sendServerError(res, err) {
+  if (isQuotaError(err)) {
+    return res.status(503).json({
+      error: 'Database quota exceeded — the service is temporarily unavailable.',
+      code:  'QUOTA_EXCEEDED',
+    });
+  }
+  return res.status(500).json({ error: 'Internal server error' });
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
 //  TWILIO (OPTIONAL)
 //  WhatsApp messages are sent as a fallback when a subscriber has no FCM token.
 //  The Twilio sandbox number is used here; swap for a provisioned number in prod.
@@ -375,6 +497,7 @@ app.post('/auth/set-role', async (req, res) => {
           ownerId:   phone,
           createdAt: Date.now(),
         });
+        invalidateVenueCache('owner_venue_created');
       }
 
       updates.venueId  = sid;
@@ -452,6 +575,18 @@ app.post('/venue/profile', async (req, res) => {
 
     await venuesCol.doc(venueId).set(update, { merge: true });
 
+    // Patch only the fields this request actually wrote — spreading a shaped
+    // document here would reset live count/category/ownerId to defaults.
+    patchVenueCache(venueId, {
+      name:     update.name,
+      address:  update.address,
+      hours:    update.hours,
+      capacity: update.capacity,
+      ...(update.phone     !== undefined ? { phone:     update.phone }     : {}),
+      ...(update.latitude  !== undefined ? { latitude:  update.latitude }  : {}),
+      ...(update.longitude !== undefined ? { longitude: update.longitude } : {}),
+    });
+
     // Notify all connected clients so they can update venue info in real time.
     io.emit('venue_updated', { venueId, name, capacity: parseInt(capacity) || 6 });
 
@@ -477,7 +612,7 @@ app.get('/venue/:venueId', async (req, res) => {
     res.json(snap.data());
   } catch (err) {
     logError('venue_detail_load_failed', err, { venueId: req.params.venueId });
-    res.status(500).json({ error: 'Internal server error' });
+    sendServerError(res, err);
   }
 });
 
@@ -492,33 +627,16 @@ app.get('/venues', async (req, res) => {
   const { category } = req.query;
 
   try {
-    // Build query — Firestore requires an index for filtered queries on multiple fields.
-    let query = venuesCol;
-    if (category) query = venuesCol.where('category', '==', category);
-
-    const snap   = await query.get();
-    const venues = snap.docs.map(d => {
-      const s = d.data();
-      return {
-        id:        s.id,
-        name:      s.name,
-        address:   s.address,
-        hours:     s.hours,
-        count:     s.count,
-        capacity:  s.capacity,
-        category:  s.category  || 'salon',
-        ownerId:   s.ownerId   || null,
-        phone:     s.phone     || null,
-        latitude:  s.lat ?? s.latitude  ?? null,
-        longitude: s.lng ?? s.longitude ?? null,
-      };
-    });
+    // Served from the shared snapshot and filtered in memory — a category
+    // filter in Firestore would still bill one read per matching document.
+    const all    = await getAllVenues();
+    const venues = category ? all.filter(v => v.category === category) : all;
 
     logInfo('venues_listed', { category: category || null, count: venues.length });
     res.json({ venues });
   } catch (err) {
     logError('venues_list_failed', err, { category });
-    res.status(500).json({ error: 'Internal server error' });
+    sendServerError(res, err);
   }
 });
 
@@ -535,29 +653,19 @@ app.get('/venues/claimable', async (req, res) => {
   const { category } = req.query;
 
   try {
-    let query = venuesCol;
-    if (category) query = venuesCol.where('category', '==', category);
-
-    const snap   = await query.get();
-    const venues = snap.docs
-      .map(d => d.data())
+    const venues = (await getAllVenues())
+      .filter(v => (category ? v.category === category : true))
       // Only include venues that have no owner yet.
-      .filter(s => !s.ownerId)
-      .map(s => ({
-        id:       s.id,
-        name:     s.name,
-        address:  s.address,
-        hours:    s.hours,
-        count:    s.count,
-        capacity: s.capacity,
-        category: s.category || 'salon',
+      .filter(v => !v.ownerId)
+      .map(({ id, name, address, hours, count, capacity, category: cat }) => ({
+        id, name, address, hours, count, capacity, category: cat,
       }));
 
     logInfo('venues_claimable_listed', { category: category || null, count: venues.length });
     res.json({ venues });
   } catch (err) {
     logError('venues_claimable_list_failed', err, { category });
-    res.status(500).json({ error: 'Internal server error' });
+    sendServerError(res, err);
   }
 });
 
@@ -587,6 +695,7 @@ app.post('/venue/claim', async (req, res) => {
 
     // Link both directions atomically: venue → owner, owner → venue.
     await venueRef.update({ ownerId: phone });
+    patchVenueCache(venueId, { ownerId: phone });
     await usersCol.doc(phone).update({
       role:     'owner',
       venueId,
@@ -638,6 +747,10 @@ app.post('/count', async (req, res) => {
     const prev  = venue.count;   // previous count — needed for threshold crossing check
 
     await venueRef.update({ count });
+
+    // Keep the cached snapshot current in place — a count change doesn't
+    // justify invalidating (and so rescanning) the whole collection.
+    patchVenueCache(venueId, { count });
 
     // Broadcast the new count to every connected mobile/web client.
     io.emit('count_update', { count, venueId, capacity: venue.capacity });
@@ -900,14 +1013,14 @@ app.post('/assistant/nearest-available', async (req, res) => {
       });
     }
 
-    // Load venues in this category and shape them for the response.
-    const snap    = await venuesCol.where('category', '==', category).get();
-    const hasHere = coords && Number.isFinite(coords.lat) && Number.isFinite(coords.lng);
+    // Load venues in this category and shape them for the response — from the
+    // shared cache, so an assistant query no longer scans the collection.
+    const inCategory = (await getAllVenues()).filter(v => v.category === category);
+    const hasHere    = coords && Number.isFinite(coords.lat) && Number.isFinite(coords.lng);
 
-    let venues = snap.docs.map((d) => {
-      const v   = d.data();
-      const lat = v.lat ?? v.latitude  ?? null;
-      const lng = v.lng ?? v.longitude ?? null;
+    let venues = inCategory.map((v) => {
+      const lat = v.latitude;
+      const lng = v.longitude;
       return {
         venueId:      v.id,
         venueName:    v.name,
@@ -1166,11 +1279,13 @@ app.post('/venues/seed-from-location', async (req, res) => {
     const data     = await fetchOverpass(query);
     const elements = data.elements || [];
 
-    let added = 0, updated = 0, skipped = 0;
+    let skipped = 0;
 
+    // ── Pass 1: shape every OSM element, no Firestore involved ───────────────
+    const candidates = [];
     for (const el of elements) {
-      const tags     = el.tags || {};
-      const name     = tags.name;
+      const tags = el.tags || {};
+      const name = tags.name;
       if (!name) { skipped++; continue; }
 
       const category = osmCategoryOf(tags);
@@ -1184,34 +1299,74 @@ app.post('/venues/seed-from-location', async (req, res) => {
         skipped++; continue;
       }
 
-      const id  = `osm_${el.type}_${el.id}`;
-      const ref = venuesCol.doc(id);
-      const existing = await ref.get();
-
-      const fields = {
-        id, name, category,
+      candidates.push({
+        id:        `osm_${el.type}_${el.id}`,
+        name,
+        category,
         address:   osmAddressOf(tags),
         hours:     tags.opening_hours || 'Hours not set',
         capacity:  DEFAULT_CAP[category] || 6,
         latitude:  elLat,
         longitude: elLng,
         source:    'osm',
-      };
-
-      if (!existing.exists) {
-        await ref.set({ ...fields, count: 0, ownerId: null, createdAt: Date.now() });
-        added++;
-      } else {
-        // Refresh address / hours / coords but preserve live count and ownerId
-        await ref.set(fields, { merge: true });
-        updated++;
-      }
+      });
     }
 
-    logInfo('venues_seeded_from_location', { lat, lng, added, updated, skipped, totalElements: elements.length });
-    res.json({ ok: true, added, updated, skipped });
+    // Keep the nearest N. A dense city centre can return thousands of elements,
+    // and one write per element would exhaust the daily write quota in a single
+    // tap on "Enable location".
+    const distFromUser = v => (v.latitude == null || v.longitude == null)
+      ? Infinity
+      : distanceKm(lat, lng, v.latitude, v.longitude);
+    candidates.sort((a, b) => distFromUser(a) - distFromUser(b));
+    const capped = candidates.slice(0, VENUE_SEED_MAX_ELEMENTS);
+    const dropped = candidates.length - capped.length;
+
+    // ── Pass 2: diff against the cached snapshot ─────────────────────────────
+    // The cache already knows every venue that exists, so deciding
+    // insert-vs-update costs no reads at all (this used to be one read per
+    // element). Unchanged venues are skipped entirely, which means re-seeding
+    // the same neighbourhood is nearly free.
+    const existing = new Map((await getAllVenues()).map(v => [v.id, v]));
+
+    const writer = db.bulkWriter();
+    let added = 0, updated = 0, unchanged = 0;
+
+    for (const v of capped) {
+      const prev = existing.get(v.id);
+
+      if (!prev) {
+        writer.set(venuesCol.doc(v.id), { ...v, count: 0, ownerId: null, createdAt: Date.now() });
+        added++;
+        continue;
+      }
+
+      const isSame = prev.name === v.name
+        && prev.address   === v.address
+        && prev.hours     === v.hours
+        && prev.latitude  === v.latitude
+        && prev.longitude === v.longitude;
+      if (isSame) { unchanged++; continue; }
+
+      // Refresh address / hours / coords but preserve live count and ownerId.
+      // `capacity` is deliberately omitted so an owner's custom capacity isn't
+      // reset by a later reseed.
+      const { capacity, ...refreshable } = v;
+      writer.set(venuesCol.doc(v.id), refreshable, { merge: true });
+      updated++;
+    }
+
+    await writer.close();
+    if (added || updated) invalidateVenueCache('osm_seed');
+
+    logInfo('venues_seeded_from_location', {
+      lat, lng, added, updated, unchanged, skipped, dropped,
+      totalElements: elements.length,
+    });
+    res.json({ ok: true, added, updated, unchanged, skipped, dropped });
   } catch (err) {
     logError('venues_seed_from_location_failed', err, { lat, lng });
+    if (isQuotaError(err)) return sendServerError(res, err);
     res.status(500).json({ error: 'Failed to fetch venues from OpenStreetMap' });
   }
 });
@@ -1226,12 +1381,12 @@ io.on('connection', async (socket) => {
   logInfo('websocket_connected', { socketId: socket.id });
 
   try {
-    // Send the full occupancy snapshot to the newly connected client.
-    const snap = await venuesCol.get();
-    const counts = snap.docs.map(d => {
-      const s = d.data();
-      return { venueId: s.id, count: s.count, capacity: s.capacity };
-    });
+    // Send the full occupancy snapshot to the newly connected client. Served
+    // from the shared cache — previously every reconnect rescanned the whole
+    // venues collection, so app backgrounding alone could burn the read quota.
+    const counts = (await getAllVenues()).map(v => ({
+      venueId: v.id, count: v.count, capacity: v.capacity,
+    }));
     socket.emit('all_counts', counts);
     logInfo('websocket_initial_counts_sent', { socketId: socket.id, count: counts.length });
   } catch (err) {
