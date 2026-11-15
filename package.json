@@ -3,7 +3,10 @@
   "version": "1.0.0",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "nodemon server.js",
+    "emulator": "firebase emulators:start --only firestore --project checkchair-local",
+    "seed:emulator": "node seed-emulator.js",
+    "dev:emulator": "node dev-emulator.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.110.0",

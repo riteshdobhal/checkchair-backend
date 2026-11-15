@@ -142,16 +142,27 @@ app.use((req, res, next) => {
 //  and fall back to a local JSON file for local development.
 // ════════════════════════════════════════════════════════════════════════════════
 
-let serviceAccount;
-if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-  // Production: credentials stored as a JSON string in an env var.
-  serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-} else {
-  // Local development: credentials stored in a gitignored JSON file.
-  serviceAccount = require('./serviceAccountKey.json');
-}
+// When FIRESTORE_EMULATOR_HOST is set, the Admin SDK talks to the local
+// emulator instead of Google's servers. The emulator accepts any project and
+// ignores credentials, so we skip the service-account key entirely — that's
+// what makes `npm run dev:emulator` work on a machine with no key file, with no
+// quota and no risk of touching production data.
+const USE_EMULATOR = Boolean(process.env.FIRESTORE_EMULATOR_HOST);
 
-initializeApp({ credential: cert(serviceAccount) });
+if (USE_EMULATOR) {
+  initializeApp({ projectId: process.env.GCLOUD_PROJECT || 'checkchair-local' });
+  logWarn('firestore_emulator_mode', { host: process.env.FIRESTORE_EMULATOR_HOST });
+} else {
+  let serviceAccount;
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    // Production: credentials stored as a JSON string in an env var.
+    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  } else {
+    // Local development: credentials stored in a gitignored JSON file.
+    serviceAccount = require('./serviceAccountKey.json');
+  }
+  initializeApp({ credential: cert(serviceAccount) });
+}
 
 const db        = getFirestore();
 const messaging = getMessaging();
